@@ -1,0 +1,47 @@
+diff --git a/run.py b/run.py
+index 0000000..0000000 100644
+--- a/run.py
++++ b/run.py
+@@
+ from methods.text_mas import TextMASMethod
+ from models import ModelWrapper
+ from utils import auto_device, set_seed
++from latentmas_stear import add_stear_arguments
+ import time
+@@
+     parser.add_argument("--latent_space_realign", action="store_true")
+     parser.add_argument("--seed", type=int, default=42)
++    add_stear_arguments(parser)
+ 
+     # vLLM support
+     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM backend for generation")
+diff --git a/methods/latent_mas.py b/methods/latent_mas.py
+index 0000000..0000000 100644
+--- a/methods/latent_mas.py
++++ b/methods/latent_mas.py
+@@
+ from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
++from latentmas_stear import apply_stear_to_latent_memory, build_controller_from_args
+ import torch
+ import argparse
+ from vllm import SamplingParams
+@@
+         self.latent_only = bool(getattr(args, "latent_only", False)) if args else False
+         self.sequential_info_only = bool(getattr(args, "sequential_info_only", False)) if args else False
++        self.stear_controller = build_controller_from_args(args)
++        self.last_stear_decision = None
+ 
+         if self.latent_only:
+             self.sequential_info_only = True
+@@
+-                past_embedding = torch.cat(embedding_record, dim=1).to(self.vllm_device)
++                past_embedding = torch.cat(embedding_record, dim=1).to(self.vllm_device)
++                stear_intervention = apply_stear_to_latent_memory(
++                    past_embedding,
++                    controller=self.stear_controller,
++                )
++                past_embedding = stear_intervention.positive_memory
++                self.last_stear_decision = stear_intervention.decision
+ 
+                 if self.args.think:
+                     judger_prompts = [f"{prompt} " for prompt in prompts]
