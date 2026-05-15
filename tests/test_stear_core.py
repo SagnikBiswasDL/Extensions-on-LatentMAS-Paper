@@ -1,100 +1,109 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from latentmas_stear import LatentSTEARController, STEARConfig
+from latentmas_stear import (
+    LatentSTEARController,
+    STEARConfig,
+    classify_reasoning_trace,
+    classify_thought,
+    compute_reasoning_steering_vector,
+    load_steering_vector,
+    save_steering_vector,
+    split_reasoning_trace,
+)
 
 
-class LatentSTEARControllerTest(unittest.TestCase):
-    def test_uncertainty_trigger_uses_entropy_and_margin(self):
-        controller = LatentSTEARController(STEARConfig(enabled=True, trigger_threshold=0.8, margin_threshold=0.1))
-        confident_logits = np.array([[8.0, 0.0, -1.0]])
-        uncertain_logits = np.array([[0.1, 0.0, -0.1]])
+class SealLikeSTEARTest(unittest.TestCase):
+    def test_classifies_execution_reflection_and_transition_thoughts(self):
+        self.assertEqual(classify_thought("Compute x = 2 + 3."), "execution")
+        self.assertEqual(classify_thought("Wait, let me double-check the arithmetic."), "reflection")
+        self.assertEqual(classify_thought("Alternatively, solve it with substitution."), "transition")
 
-        confident_entropy, confident_margin = controller.uncertainty_from_logits(confident_logits)
-        uncertain_entropy, uncertain_margin = controller.uncertainty_from_logits(uncertain_logits)
+    def test_splits_and_classifies_reasoning_trace(self):
+        trace = "Compute the sum directly.\n\nWait, verify the carry.\n\nAnother approach is to factor it."
 
-        self.assertLess(confident_entropy[0], 0.2)
-        self.assertGreater(confident_margin[0], 0.9)
-        self.assertGreater(uncertain_entropy[0], 0.95)
-        self.assertLess(uncertain_margin[0], 0.1)
-        self.assertFalse(controller.trigger_mask(logits=confident_logits)[0])
-        self.assertTrue(controller.trigger_mask(logits=uncertain_logits)[0])
+        classified = classify_reasoning_trace(trace)
 
-    def test_select_key_evidence_prefers_query_aligned_memory(self):
-        controller = LatentSTEARController(STEARConfig(enabled=True, evidence_ratio=0.5, max_evidence_tokens=2))
-        memory = np.array(
+        self.assertEqual([thought for thought, _ in classified], split_reasoning_trace(trace))
+        self.assertEqual([label for _, label in classified], ["execution", "reflection", "transition"])
+
+    def test_computes_execution_minus_reflection_transition_vector(self):
+        reps = np.array(
             [
-                [
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    [0.9, 0.1, 0.0],
-                    [-1.0, 0.0, 0.0],
-                ]
+                [2.0, 0.0],
+                [4.0, 0.0],
+                [0.0, 2.0],
+                [0.0, 4.0],
             ]
         )
-        query = np.array([[1.0, 0.0, 0.0]])
+        labels = ["execution", "execution", "reflection", "transition"]
 
-        indices, scores = controller.select_key_evidence(memory, query=query)
+        steering = compute_reasoning_steering_vector(reps, labels, normalize=False)
 
-        self.assertEqual(indices.shape, (1, 2))
-        self.assertEqual(indices[0, 0], 0)
-        self.assertEqual(indices[0, 1], 2)
-        self.assertGreater(scores[0, 0], scores[0, 1])
+        np.testing.assert_allclose(steering.vector, np.array([3.0, -3.0]))
+        self.assertEqual(steering.execution_count, 2)
+        self.assertEqual(steering.reflection_transition_count, 2)
 
-    def test_reinject_moves_target_toward_selected_evidence(self):
-        controller = LatentSTEARController(STEARConfig(enabled=True, injection_strength=0.5))
-        target = np.array([[0.0, 1.0]])
-        evidence = np.array([[[1.0, 0.0], [1.0, 0.0]]])
+    def test_normalized_steering_vector_has_unit_norm(self):
+        reps = np.array([[2.0, 0.0], [0.0, 2.0]])
+        labels = ["execution", "reflection"]
 
-        updated = controller.reinject(target, evidence)
+        steering = compute_reasoning_steering_vector(reps, labels, normalize=True)
 
-        self.assertEqual(updated.shape, target.shape)
-        self.assertGreater(updated[0, 0], target[0, 0])
-        self.assertEqual(updated[0, 1], target[0, 1])
+        self.assertAlmostEqual(float(np.linalg.norm(steering.vector)), 1.0)
 
-    def test_counterfactual_reverses_only_selected_memory(self):
-        controller = LatentSTEARController(STEARConfig(enabled=True, counterfactual_mode="reverse"))
-        memory = np.arange(12, dtype=float).reshape(1, 4, 3)
-        indices = np.array([[1, 3]])
-
-        counterfactual = controller.build_counterfactual_memory(memory, indices)
-
-        np.testing.assert_array_equal(counterfactual[0, 0], memory[0, 0])
-        np.testing.assert_array_equal(counterfactual[0, 2], memory[0, 2])
-        np.testing.assert_array_equal(counterfactual[0, 1], memory[0, 3])
-        np.testing.assert_array_equal(counterfactual[0, 3], memory[0, 1])
-
-    def test_contrastive_logits_follow_stear_formula(self):
-        controller = LatentSTEARController(STEARConfig(enabled=True, counterfactual_alpha=0.25))
-        positive = np.array([[2.0, 1.0]])
-        negative = np.array([[0.0, 4.0]])
-
-        calibrated = controller.contrastive_logits(positive, negative)
-
-        np.testing.assert_allclose(calibrated, np.array([[2.5, 0.25]]))
-
-    def test_intervention_returns_positive_and_negative_memory_when_triggered(self):
+    def test_apply_to_memory_steers_last_boundary_by_default(self):
         controller = LatentSTEARController(
-            STEARConfig(enabled=True, trigger_threshold=0.8, margin_threshold=0.1, injection_strength=0.5)
+            STEARConfig(enabled=True, alpha=0.5, boundary_strategy="last", normalize_vector=False),
+            steering_vector=np.array([2.0, -2.0]),
         )
-        memory = np.array(
-            [
-                [
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                    [1.0, 0.0],
-                ]
-            ]
+        memory = np.zeros((1, 3, 2), dtype=float)
+
+        intervention = controller.apply_to_memory(memory)
+
+        self.assertTrue(intervention.decision.applied)
+        np.testing.assert_allclose(intervention.steered_memory[0, 0], np.array([0.0, 0.0]))
+        np.testing.assert_allclose(intervention.steered_memory[0, 1], np.array([0.0, 0.0]))
+        np.testing.assert_allclose(intervention.steered_memory[0, 2], np.array([1.0, -1.0]))
+
+    def test_apply_to_memory_supports_explicit_boundary_indices(self):
+        controller = LatentSTEARController(
+            STEARConfig(enabled=True, alpha=1.0, boundary_strategy="indices", normalize_vector=False),
+            steering_vector=np.array([1.0, 1.0]),
         )
-        uncertain_logits = np.array([[0.0, 0.0, 0.0]])
+        memory = np.zeros((2, 4, 2), dtype=float)
+        boundary_indices = np.array([[0, 2], [1, 3]])
 
-        intervention = controller.intervene_latent_memory(memory, logits=uncertain_logits)
+        intervention = controller.apply_to_memory(memory, boundary_indices=boundary_indices)
 
-        self.assertTrue(intervention.decision.triggered[0])
-        self.assertIsNotNone(intervention.negative_memory)
-        self.assertEqual(intervention.positive_memory.shape, memory.shape)
-        self.assertGreater(intervention.positive_memory[0, -1, 0], memory[0, -1, 0])
+        np.testing.assert_allclose(intervention.steered_memory[0, 0], np.array([1.0, 1.0]))
+        np.testing.assert_allclose(intervention.steered_memory[0, 1], np.array([0.0, 0.0]))
+        np.testing.assert_allclose(intervention.steered_memory[0, 2], np.array([1.0, 1.0]))
+        np.testing.assert_allclose(intervention.steered_memory[1, 1], np.array([1.0, 1.0]))
+        np.testing.assert_allclose(intervention.steered_memory[1, 3], np.array([1.0, 1.0]))
+
+    def test_disabled_or_missing_vector_leaves_memory_unchanged(self):
+        controller = LatentSTEARController(STEARConfig(enabled=False))
+        memory = np.ones((1, 2, 3), dtype=float)
+
+        intervention = controller.apply_to_memory(memory)
+
+        self.assertFalse(intervention.decision.applied)
+        self.assertIs(intervention.steered_memory, memory)
+
+    def test_save_and_load_steering_vector(self):
+        reps = np.array([[1.0, 0.0], [0.0, 1.0]])
+        steering = compute_reasoning_steering_vector(reps, ["execution", "transition"], normalize=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "stear_vector.npz"
+            save_steering_vector(path, steering)
+            loaded = load_steering_vector(path)
+
+        np.testing.assert_allclose(loaded, steering.vector)
 
 
 if __name__ == "__main__":

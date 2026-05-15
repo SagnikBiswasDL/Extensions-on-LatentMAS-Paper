@@ -1,31 +1,36 @@
 # Extensions on LatentMAS: STEAR for Latent Reasoning
 
-This repository contains a lightweight implementation of a **STEAR-style
-intervention for LatentMAS**. The goal is not tool calling; it is to test
-whether STEAR's inference-time evidence intervention pattern improves latent
+This repository contains a lightweight implementation of **STEAR as a
+SEAL-like steering method** for LatentMAS. The goal is not tool calling; it is
+to test whether representation-level reasoning calibration improves latent
 multi-agent reasoning.
 
 ## What is implemented
 
-The original STEAR method for LLM-style decoding uses four ideas:
+Here, "STEAR" means the same family of method as SEAL (*Steerable Reasoning
+Calibration*):
 
-1. trigger only on high-risk/uncertain decoding steps;
-2. select token-conditioned key evidence;
-3. reinject that evidence into the representation region where grounding is
-   most useful;
-4. optionally calibrate against a localized counterfactual branch.
+1. split reasoning traces into thought blocks;
+2. classify thoughts as **execution**, **reflection**, or **transition**;
+3. extract a steering vector in latent space:
 
-LatentMAS communicates through hidden-state working memory rather than explicit
-visual patches. This extension adapts STEAR to that setting:
+   `S = mean(H_execution) - mean(H_reflection_or_transition)`
 
-- **Uncertainty trigger**: uses normalized next-token entropy and top-two
-  probability margin when logits are available.
-- **Key evidence selection**: retrieves latent memory slots most aligned with
-  the active query hidden state.
-- **Latent reinjection**: applies a controlled residual update to the active
-  latent state using the selected memory evidence.
-- **Counterfactual latent branch**: perturbs only selected latent-memory slots
-  (reverse/shuffle or homogenize) for contrastive calibration.
+4. during inference, calibrate hidden states with:
+
+   `H_steered = H + alpha * S`
+
+LatentMAS communicates through hidden-state working memory rather than visible
+chain-of-thought tokens. This extension adapts SEAL-like STEAR to that setting:
+
+- **Thought labeling utilities**: keyword-based classification matching SEAL's
+  execution/reflection/transition categories.
+- **Steering-vector extraction**: computes the execution-minus-nonexecution
+  direction from thought-boundary hidden states.
+- **Latent memory intervention**: applies `alpha * S` to LatentMAS working
+  memory slots at reasoning boundaries.
+- **Boundary strategies**: steer only the final latent slot (`last`), every slot
+  (`all`), or explicit slot indices (`indices`).
 
 The code is backend-light: it is tested with NumPy and works with PyTorch
 tensors in a LatentMAS runtime without importing PyTorch unless tensor inputs
@@ -33,7 +38,8 @@ come from PyTorch.
 
 ## Files
 
-- `latentmas_stear/core.py` - STEAR controller and tensor operations.
+- `latentmas_stear/core.py` - thought classification, steering-vector
+  extraction, and latent intervention.
 - `latentmas_stear/integration.py` - CLI and LatentMAS integration helpers.
 - `examples/latentmas_stear_hook.py` - upstream LatentMAS patch points.
 - `patches/upstream_latentmas_stear.patch` - minimal diff for the official
@@ -67,19 +73,23 @@ intervention = apply_stear_to_latent_memory(
     past_embedding,
     controller=self.stear_controller,
 )
-past_embedding = intervention.positive_memory
+past_embedding = intervention.steered_memory
 self.last_stear_decision = intervention.decision
 ```
 
-If the caller can afford a second decode, `intervention.negative_memory` can be
-inserted into a counterfactual prompt and the two output distributions can be
-combined with:
+## Steering vector extraction
+
+Collect hidden states at thought boundaries from an offline calibration set,
+label each thought, then compute and save the vector:
 
 ```python
-calibrated_logits = self.stear_controller.contrastive_logits(
-    positive_logits,
-    negative_logits,
+from latentmas_stear import compute_reasoning_steering_vector, save_steering_vector
+
+steering = compute_reasoning_steering_vector(
+    thought_boundary_hidden_states,  # shape: [num_thoughts, hidden]
+    thought_labels,                  # execution/reflection/transition
 )
+save_steering_vector("stear_vector.npz", steering)
 ```
 
 ## Suggested experiment flag
@@ -92,9 +102,9 @@ python run.py \
   --prompt sequential \
   --latent_steps 10 \
   --stear \
-  --stear_trigger_threshold 0.65 \
-  --stear_evidence_ratio 0.25 \
-  --stear_injection_strength 0.15
+  --stear_vector_path stear_vector.npz \
+  --stear_alpha 1.0 \
+  --stear_boundary_strategy last
 ```
 
 ## Validation

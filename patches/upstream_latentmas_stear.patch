@@ -40,7 +40,7 @@ index 0000000..0000000 100644
 +                    past_embedding,
 +                    controller=self.stear_controller,
 +                )
-+                past_embedding = stear_intervention.positive_memory
++                past_embedding = stear_intervention.steered_memory
 +                self.last_stear_decision = stear_intervention.decision
  
                  if self.args.think:

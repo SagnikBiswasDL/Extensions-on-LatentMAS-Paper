@@ -1,18 +1,10 @@
-"""Example patch points for adding STEAR to upstream LatentMAS.
-
-This file is intentionally not an executable replacement for LatentMAS. It
-shows the minimal integration points in the upstream project:
-
-1. add CLI arguments in ``run.py``;
-2. create a controller in ``LatentMASMethod.__init__``;
-3. apply it to the latent ``past_embedding`` before judger decoding.
-"""
+"""Example patch points for SEAL-like STEAR in upstream LatentMAS."""
 
 from latentmas_stear import add_stear_arguments, apply_stear_to_latent_memory, build_controller_from_args
 
 
 def patch_run_parser(parser):
-    """Call this after LatentMAS registers its existing argparse flags."""
+    """Call this after upstream LatentMAS registers its argparse flags."""
 
     return add_stear_arguments(parser)
 
@@ -21,26 +13,25 @@ def patch_latentmas_init(self, args):
     """Add this inside ``LatentMASMethod.__init__``."""
 
     self.stear_controller = build_controller_from_args(args)
+    self.last_stear_decision = None
 
 
-def patch_before_judger_embedding_insert(self, past_embedding, judger_query=None):
-    """Add this in ``LatentMASMethod.run_batch_vllm`` before prompt insertion.
+def patch_before_judger_embedding_insert(self, past_embedding, boundary_indices=None):
+    """Steer latent memory before the judger sees prior agents' latent states.
 
     Upstream location:
 
     ``past_embedding = torch.cat(embedding_record, dim=1).to(self.vllm_device)``
 
-    Immediately after that line, call this helper and then continue using the
-    returned positive memory as ``past_embedding``.
+    The default ``--stear_boundary_strategy last`` applies the SEAL-style
+    steering vector to the final latent slot, which is the latent analogue of a
+    thought boundary before the next reasoning step.
     """
 
     intervention = apply_stear_to_latent_memory(
         past_embedding,
         controller=self.stear_controller,
-        query=judger_query,
+        boundary_indices=boundary_indices,
     )
-    past_embedding = intervention.positive_memory
-
-    # Optional: store metadata in the run trace for ablations and diagnostics.
     self.last_stear_decision = intervention.decision
-    return past_embedding
+    return intervention.steered_memory

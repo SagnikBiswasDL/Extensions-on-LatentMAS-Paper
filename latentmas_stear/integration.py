@@ -1,81 +1,60 @@
-"""Convenience hooks for wiring STEAR into LatentMAS experiments."""
+"""Integration helpers for SEAL-like STEAR in LatentMAS."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from .core import LatentSTEARController, STEARConfig, STEARIntervention
+from .core import LatentSTEARController, STEARConfig, STEARIntervention, load_steering_vector
 
 
 def add_stear_arguments(parser: Any) -> Any:
-    """Register CLI flags expected by :class:`STEARConfig.from_args`.
+    """Register CLI flags for latent reasoning steering."""
 
-    This function accepts an ``argparse.ArgumentParser``-compatible object and
-    returns it for fluent setup in upstream ``run.py`` files.
-    """
-
-    parser.add_argument("--stear", action="store_true", help="Enable STEAR latent-memory intervention for LatentMAS.")
+    parser.add_argument("--stear", action="store_true", help="Enable SEAL-like latent reasoning steering.")
     parser.add_argument(
-        "--stear_trigger_threshold",
+        "--stear_vector_path",
+        type=str,
+        default=None,
+        help="Path to a .npy/.npz steering vector extracted from labeled thought hidden states.",
+    )
+    parser.add_argument(
+        "--stear_alpha",
         type=float,
-        default=STEARConfig.trigger_threshold,
-        help="Normalized entropy threshold above which STEAR intervenes.",
+        default=STEARConfig.alpha,
+        help="Strength for hidden-state intervention: H <- H + alpha * S.",
     )
     parser.add_argument(
-        "--stear_margin_threshold",
-        type=float,
-        default=STEARConfig.margin_threshold,
-        help="Top-two probability margin below which STEAR intervenes.",
+        "--stear_boundary_strategy",
+        choices=["last", "all", "indices"],
+        default=STEARConfig.boundary_strategy,
+        help="Which latent memory slots to steer. 'last' matches the judger handoff use case.",
     )
     parser.add_argument(
-        "--stear_evidence_ratio",
-        type=float,
-        default=STEARConfig.evidence_ratio,
-        help="Fraction of latent-memory slots selected as key evidence.",
+        "--stear_normalize_vector",
+        action="store_true",
+        default=STEARConfig.normalize_vector,
+        help="Normalize extracted steering vectors before applying them.",
     )
     parser.add_argument(
-        "--stear_min_evidence_tokens",
-        type=int,
-        default=STEARConfig.min_evidence_tokens,
-        help="Minimum number of latent slots selected as evidence.",
+        "--stear_no_normalize_vector",
+        action="store_false",
+        dest="stear_normalize_vector",
+        help="Use the raw extracted steering vector magnitude.",
     )
     parser.add_argument(
-        "--stear_max_evidence_tokens",
-        type=int,
-        default=STEARConfig.max_evidence_tokens,
-        help="Maximum number of latent slots selected as evidence.",
-    )
-    parser.add_argument(
-        "--stear_injection_strength",
-        type=float,
-        default=STEARConfig.injection_strength,
-        help="Residual strength for injecting selected evidence into the active latent state.",
-    )
-    parser.add_argument(
-        "--stear_counterfactual_alpha",
-        type=float,
-        default=STEARConfig.counterfactual_alpha,
-        help="Contrastive logit strength for positive-vs-counterfactual calibration.",
-    )
-    parser.add_argument(
-        "--stear_counterfactual_mode",
-        choices=["reverse", "shuffle", "homogenize"],
-        default=STEARConfig.counterfactual_mode,
-        help="How selected latent slots are perturbed in the counterfactual branch.",
-    )
-    parser.add_argument(
-        "--stear_homogenize_gamma",
-        type=float,
-        default=STEARConfig.homogenize_gamma,
-        help="Interpolation strength for the homogenize counterfactual mode.",
+        "--stear_preserve_hidden_norm",
+        action="store_true",
+        help="Rescale steered states back to their original hidden-state norm.",
     )
     return parser
 
 
 def build_controller_from_args(args: Any) -> LatentSTEARController:
-    """Create a STEAR controller from a LatentMAS argparse namespace."""
+    """Create a controller and load a vector when ``--stear_vector_path`` is set."""
 
-    return LatentSTEARController(STEARConfig.from_args(args))
+    config = STEARConfig.from_args(args)
+    vector = load_steering_vector(config.steering_vector_path) if config.steering_vector_path else None
+    return LatentSTEARController(config=config, steering_vector=vector)
 
 
 def apply_stear_to_latent_memory(
@@ -83,31 +62,23 @@ def apply_stear_to_latent_memory(
     *,
     controller: Optional[LatentSTEARController] = None,
     args: Optional[Any] = None,
-    query: Optional[Any] = None,
-    logits: Optional[Any] = None,
-    uncertainty: Optional[Any] = None,
-    margin: Optional[Any] = None,
-    attention_scores: Optional[Any] = None,
+    steering_vector: Optional[Any] = None,
+    boundary_indices: Optional[Any] = None,
 ) -> STEARIntervention:
-    """Apply STEAR to the LatentMAS embedding record.
+    """Apply SEAL-like steering to LatentMAS ``embedding_record`` memory.
 
-    In upstream LatentMAS, ``past_embedding`` corresponds to the concatenated
-    ``embedding_record`` tensor in ``LatentMASMethod.run_batch_vllm`` with shape
-    ``[batch, latent_memory_len, hidden]``. The returned ``positive_memory`` can
-    replace that tensor before it is inserted into the judger prompt embedding.
+    In upstream LatentMAS, call this after:
 
-    If the caller can run a second counterfactual decode, ``negative_memory`` is
-    the matching perturbed memory for that branch; otherwise it can be ignored
-    and the positive reinjection still provides the main STEAR intervention.
+    ``past_embedding = torch.cat(embedding_record, dim=1).to(self.vllm_device)``
+
+    Then replace ``past_embedding`` with ``intervention.steered_memory`` before
+    inserting latent memory into the judger prompt.
     """
 
     if controller is None:
         controller = build_controller_from_args(args) if args is not None else LatentSTEARController()
-    return controller.intervene_latent_memory(
+    return controller.apply_to_memory(
         past_embedding,
-        query=query,
-        logits=logits,
-        uncertainty=uncertainty,
-        margin=margin,
-        attention_scores=attention_scores,
+        steering_vector=steering_vector,
+        boundary_indices=boundary_indices,
     )
